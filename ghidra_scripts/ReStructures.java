@@ -2,7 +2,6 @@
 // @category BROCSTRUCT
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
@@ -21,19 +20,33 @@ import ghidra.program.model.pcode.LocalSymbolMap;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.PcodeOpAST;
 import ghidra.program.model.pcode.Varnode;
+import ghidra.util.Msg;
 
 import org.jgrapht.*;
+import org.jgrapht.alg.shortestpath.DijkstraShortestPath;
 import org.jgrapht.graph.*;
 import org.jgrapht.traverse.*;
 
 public class ReStructures extends GhidraScript {
   public void run() throws Exception {
+    if (currentProgram == null) {
+      Msg.showError(monitor, null, "Error", "No program");
+      return;
+    }
+
     Listing listing = currentProgram.getListing();
     Function currentFunction = listing.getFunctionContaining(currentAddress);
+    if (currentFunction == null) {
+      Msg.showError(monitor, null, "Error", "Place cursor inside a function");
+      return;
+    }
     println("Analyzing function: " + currentFunction.getName());
 
     DecompInterface ifc = new DecompInterface();
-    ifc.openProgram(currentProgram);
+    if (!ifc.openProgram(currentProgram)) {
+      Msg.showError(monitor, null, "Error", "Decompilation failed");
+      return;
+    }
     DecompileResults res = ifc.decompileFunction(currentFunction, 30, monitor);
     HighFunction highFunction = res.getHighFunction();
     List<PcodeOpAST> pcodeOps = new ArrayList<PcodeOpAST>();
@@ -46,10 +59,8 @@ public class ReStructures extends GhidraScript {
       Varnode[] inputs = op.getInputs();
       if (output != null) {
         g.addVertex(output);
-      }
-      for (int i = 0; i < inputs.length; ++i) {
-        g.addVertex(inputs[i]);
-        if (output != null) {
+        for (int i = 0; i < inputs.length; ++i) {
+          g.addVertex(inputs[i]);
           g.addEdge(inputs[i], output);
         }
       }
@@ -61,17 +72,13 @@ public class ReStructures extends GhidraScript {
       process(topVIterator.next());
     }
 
-    // dbg: collect all used opcodes
-    Set<Integer> dbgOps = new HashSet<Integer>();
-    for (PcodeOpAST op : pcodeOps) {
-      dbgOps.add(op.getOpcode());
-    }
-    println("all ops used: " + dbgOps.stream().map(op -> PcodeOp.getMnemonic(op)).collect(Collectors.joining(", ")));
-
     List<Varnode> params = new ArrayList<Varnode>();
+    List<String> paramNameStrings = new ArrayList<String>();
     LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
     for (int i = 0; i < localSymbolMap.getNumParams(); ++i) {
-      params.add(localSymbolMap.getParam(i).getRepresentative());
+      Varnode param = localSymbolMap.getParam(i).getRepresentative();
+      params.add(param);
+      paramNameStrings.add(param.getHigh().getName());
     }
     if (params.isEmpty()) {
       println("Function has no parameters :(");
@@ -81,56 +88,28 @@ public class ReStructures extends GhidraScript {
     for (Varnode param : params) {
       paramNames.put(param.getHigh().getName(), param);
     }
-    List<String> paramNameStrings = new ArrayList<String>(paramNames.keySet());
     String choice = askChoice("Param selection", "Choose one", paramNameStrings, paramNameStrings.get(0));
 
-    Varnode param = paramNames.get(choice);
-    String paramName = param.getHigh().getName();
-    println("digging " + paramName + " aka " + param.toString());
-    Iterator<Varnode> dfs = new DepthFirstIterator<>(g, param);
+    Varnode paramVarnode = paramNames.get(choice);
 
     Map<Long, Map<Integer, Integer>> accesses = new HashMap<>();
-    while (dfs.hasNext()) {
-      Varnode varnode = dfs.next(); // varnode is a child of param
-      List<Node> paths = db.get(varnode);
-      for (Node path : paths) {
-        if (path.opcode == PcodeOp.LOAD) {
-          Node input = path.inputs.get(0);
-          String baseName = getBaseName(input);
-          Long offset = getOffset(input);
-          printf("READ base: %s, offset: %d, size: %d\n", baseName, offset, path.bytesize);
-          Map<Integer, Integer> sizes = accesses.getOrDefault(offset, new TreeMap<Integer, Integer>());
-          Integer freq = sizes.getOrDefault(path.bytesize, 0) + 1;
-          sizes.put(path.bytesize, freq);
-          accesses.put(offset, sizes);
-        }
-      }
-    }
-
+    // hit READ: PcodeOpAST is LOAD and its output Varnode has paramVarnode as base
+    // hit WRITE: PcodeOpAST is STORE and its input[1] Varnode has paramVarnode as base
     for (PcodeOpAST op : pcodeOps) {
-      if (op.getOpcode() == PcodeOp.STORE) {
-        Varnode dst = op.getInput(1);
-        dfs = new DepthFirstIterator<>(g, param);
-        boolean desired = false;
-
-        while (dfs.hasNext()) {
-          Varnode varnode = dfs.next();
-          if (dst == varnode) {
-            desired = true;
-            break;
-          }
-        }
-        if (desired) {
+      int opcode = op.getOpcode();
+      if (opcode == PcodeOp.STORE || opcode == PcodeOp.LOAD) {
+        Varnode dst = opcode == PcodeOp.STORE ? op.getInput(1) : op.getOutput();
+        if (DijkstraShortestPath.findPathBetween(g, paramVarnode, dst) != null) {
           List<Node> paths = db.get(dst);
           for (Node path : paths) {
-            Node input = path;
+            Node input = opcode == PcodeOp.STORE ? path : path.inputs.get(0);
             String baseName = getBaseName(input);
             Long offset = getOffset(input);
-            int bytesize = op.getInput(2).getSize();
+            int bytesize = opcode == PcodeOp.STORE ? op.getInput(2).getSize() : path.bytesize;
             if (baseName.isEmpty()) {
-              baseName = "errrr -> " + input.toString();
+              baseName = "error: " + input.toString();
             }
-            printf("WRITE base: %s, offset: %d, size: %d\n", baseName, offset, bytesize);
+            printf("%s base: %s, offset: %d, size: %d\n", PcodeOp.getMnemonic(opcode), baseName, offset, bytesize);
             Map<Integer, Integer> sizes = accesses.getOrDefault(offset, new TreeMap<Integer, Integer>());
             Integer freq = sizes.getOrDefault(bytesize, 0) + 1;
             sizes.put(bytesize, freq);
@@ -140,17 +119,17 @@ public class ReStructures extends GhidraScript {
       }
     }
 
-    println("===========");
     long structureSize = 0;
     for (Long offset : accesses.keySet()) {
       for (Map.Entry<Integer, Integer> entry : accesses.get(offset).entrySet()) {
-        printf("base: %s, offset: 0x%x, size: 0x%x, count: %d\n", param.getHigh().getName(), offset, entry.getKey(),
+        printf("base: %s, offset: 0x%x, size: 0x%x, count: %d\n", paramVarnode.getHigh().getName(), offset,
+            entry.getKey(),
             entry.getValue());
         structureSize = Math.max(structureSize, offset + entry.getKey());
       }
     }
-    println("\n" + buildStructure(accesses, (int) structureSize, paramName));
-
+    String structureString = buildStructure(accesses, (int) structureSize, choice);
+    println("\n" + structureString);
   }
 
   String getBaseName(Node input) {
@@ -178,7 +157,8 @@ public class ReStructures extends GhidraScript {
   Map<Varnode, List<Node>> db = new HashMap<Varnode, List<Node>>();
 
   String buildStructure(Map<Long, Map<Integer, Integer>> accesses, int size, String paramName) {
-    StructureDataType structureDataType = new StructureDataType(new CategoryPath("/struct"), "S_" + paramName, size);
+    StructureDataType structureDataType = new StructureDataType(new CategoryPath("/BROCSTRUCT"), "S_" + paramName,
+        size);
     DataTypeManager dm = currentProgram.getDataTypeManager();
     BuiltInDataTypeManager bdm = BuiltInDataTypeManager.getDataTypeManager();
     Map<Integer, DataType> size_lookup = new HashMap<>();
@@ -186,13 +166,70 @@ public class ReStructures extends GhidraScript {
     size_lookup.put(2, bdm.getDataType("/short"));
     size_lookup.put(4, bdm.getDataType("/int"));
     size_lookup.put(8, bdm.getDataType("/longlong"));
-    for (Long offset : accesses.keySet()) {
-      Map<Integer, Integer> sizes = accesses.get(offset);
+    List<Pair<Integer, Integer>> accessesList = new ArrayList<Pair<Integer, Integer>>();
+    for (Long offsetLong : accesses.keySet()) {
+      Map<Integer, Integer> sizes = accesses.get(offsetLong);
       Integer size0 = Collections.max(sizes.entrySet(), Map.Entry.comparingByValue()).getKey();
-      structureDataType.replaceAtOffset((int) offset.longValue(), size_lookup.get(size0), size0, "field" + offset, "");
+      int offset = (int) offsetLong.longValue();
+      accessesList.add(new Pair<Integer, Integer>(offset, size0));
+    }
+    accessesList = fixOverlaps(accessesList);
+    for (Pair<Integer, Integer> p : accessesList) {
+      DataType type = size_lookup.get(p.second());
+      printf("setting offset %d size %d %s\n", p.first(), p.second(), "field" + p.first());
+      structureDataType.replaceAtOffset(p.first(), type, p.second(), "field" + p.first(), "");
     }
     dm.addDataType(structureDataType, DataTypeConflictHandler.REPLACE_HANDLER);
     return structureDataType.toString();
+  }
+
+  private boolean intersect(Pair<Integer, Integer> a, Pair<Integer, Integer> b) {
+    int aright = a.first() + a.second() - 1;
+    int bright = b.first() + b.second() - 1;
+    return a.first() <= bright && b.first() <= aright;
+  }
+
+  private List<Pair<Integer, Integer>> fixOverlaps(List<Pair<Integer, Integer>> accessesList) {
+    List<Pair<Integer, Integer>> result = new ArrayList<Pair<Integer, Integer>>();
+    for (Pair<Integer, Integer> newPair : accessesList) {
+      List<Pair<Integer, Integer>> conflictedToRemove = new ArrayList<>();
+      for (Pair<Integer, Integer> oldPair : result) {
+        if (intersect(newPair, oldPair)) {
+          conflictedToRemove.add(oldPair);
+        }
+      }
+      result.removeAll(conflictedToRemove);
+      if (conflictedToRemove.isEmpty()) {
+        result.add(newPair);
+      } else {
+        conflictedToRemove.sort((a, b) -> a.first() - b.first());
+        while (!conflictedToRemove.isEmpty()) {
+          Pair<Integer, Integer> old = conflictedToRemove.getFirst();
+          conflictedToRemove.remove(0);
+          int ol = old.first();
+          int or = old.first() + old.second();
+          int nl = newPair.first();
+          int nr = newPair.first() + newPair.second();
+          int minL = Integer.min(ol, nl);
+          int maxL = Integer.max(ol, nl);
+          int minR = Integer.min(or, nr);
+          int maxR = Integer.max(or, nr);
+          List<Pair<Integer, Integer>> splitted = new ArrayList<>();
+          splitted.add(new Pair<Integer, Integer>(minL, maxL - minL));
+          splitted.add(new Pair<Integer, Integer>(maxL, minR - maxL));
+          Pair<Integer, Integer> updatedNewPair = new Pair<Integer, Integer>(minR, maxR - minR);
+          if (conflictedToRemove.isEmpty()) {
+            if (updatedNewPair.second() > 0) {
+              splitted.add(updatedNewPair);
+            }
+          } else {
+            newPair = updatedNewPair;
+          }
+          result.addAll(splitted);
+        }
+      }
+    }
+    return result;
   }
 
   private void process(Varnode varnode) {
@@ -265,88 +302,3 @@ public class ReStructures extends GhidraScript {
     db.put(varnode, nodes);
   }
 }
-// opengl32.dll: FUN_18003fd34 <=> InternalDescribePixelFormat
-// https://blog.grimm-co.com/2020/11/automated-struct-identification-with.html
-// https://github.com/kohnakagawa/PracticalPCode
-// https://riverloopsecurity.com/blog/2019/05/pcode/
-// https://github.com/NationalSecurityAgency/ghidra/discussions/4944
-// https://github.com/niconaus/pcode-interpreter
-// https://www.ssrg.ece.vt.edu/papers/vstte22.pdf
-// https://github.com/ksluckow/awesome-symbolic-execution
-// https://www.msreverseengineering.com/blog/2019/8/5/automation-techniques-in-c-reverse-engineering
-
-/*
- * 
- * Structure S_param_5 {
- * 0 int 4 field0 ""
- * 4 int 4 field4 ""
- * 8 char 1 field8 ""
- * 9 char 1 field9 ""
- * 10 int 4 field10 ""
- * 14 short 2 field14 ""
- * 16 char 1 field16 ""
- * 18 char 1 field18 ""
- * 20 char 1 field20 ""
- * 21 char 1 field21 ""
- * 22 char 1 field22 ""
- * 23 char 1 field23 ""
- * 24 int 4 field24 ""
- * 28 longlong 8 field28 ""
- * 36 int 4 field36 ""
- * }
- * 
- * typedef struct PIXELFORMATDESCRIPTOR
- * {
- * 0 WORD nSize;
- * 2 WORD nVersion;
- * 4 DWORD dwFlags;
- * 8 BYTE iPixelType;
- * 9 BYTE cColorBits;
- * 10 BYTE cRedBits;
- * 11 BYTE cRedShift;
- * 12 BYTE cGreenBits;
- * 13 BYTE cGreenShift;
- * 14 BYTE cBlueBits;
- * 15 BYTE cBlueShift;
- * 16 BYTE cAlphaBits;
- * 17 BYTE cAlphaShift;
- * 18 BYTE cAccumBits;
- * 19 BYTE cAccumRedBits;
- * 20 BYTE cAccumGreenBits;
- * 21 BYTE cAccumBlueBits;
- * 22 BYTE cAccumAlphaBits;
- * 23 BYTE cDepthBits;
- * 24 BYTE cStencilBits;
- * 25 BYTE cAuxBuffers;
- * 26 BYTE iLayerType;
- * 27 BYTE bReserved;
- * 28 DWORD dwLayerMask;
- * 32 DWORD dwVisibleMask;
- * 36 DWORD dwDamageMask;
- * }
- * 
- * 
- * 
- * typedef struct _DDSURFACEDESC aka param_
-{
-    DWORD		dwSize;			// size of the DDSURFACEDESC structure
-    DWORD		dwFlags;		// determines what fields are valid
-    DWORD		dwHeight;		// height of surface to be created
-    DWORD		dwWidth;		// width of input surface
-    LONG		lPitch;			// distance to start of next line (return value)
-    DWORD		dwBackBufferCount;	// number of back buffers requested
-    DWORD		dwZBufferBitDepth;	// depth of Z buffer requested
-    DWORD		dwAlphaBitDepth;	// depth of alpha buffer requested
-    DWORD		dwCompositionOrder;	// blt order for the surface, 0 is background
-    DWORD		hWnd;			// window handle associated with surface
-    DWORD		lpSurface;		// pointer to an associated surface memory
-    DDCOLORKEY		ddckCKDestOverlay;	// color key for destination overlay use
-    DDCOLORKEY		ddckCKDestBlt;		// color key for destination blt use
-    DDCOLORKEY		ddckCKSrcOverlay;	// color key for source overlay use
-    DDCOLORKEY		ddckCKSrcBlt;		// color key for source blt use
-    DWORD		lpClipList;		// clip list (return value)
-    DWORD		lpDDSurface;		// pointer to DirectDraw Surface struct (return value)
-    DDPIXELFORMAT	ddpfPixelFormat; 	// pixel format description of the surface
-    DDSCAPS		ddsCaps;		// direct draw surface capabilities
-} DDSURFACEDESC;
- */
